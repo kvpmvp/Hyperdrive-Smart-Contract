@@ -1,103 +1,67 @@
+# Algorand Crowdfunding (PyTeal + Python SDK)
 
-# Algorand Crowdfunding Escrow (PyTEAL)
+This package implements a **stateful smart contract** that holds ALGO contributions and a developer ASA, for a crowdfunding campaign with:
 
-This project implements a **stateful smart contract** that acts as an escrow for an Algorand-based crowdfunding campaign.
+- Fixed **goal** (in ALGOs)
+- Fixed **exchange rate** (X ASA / 1 ALGO)
+- **2% deposit** from creator at setup
+- Success path: distribute ASA to contributors, pay **2% admin fee**, close remainder to creator
+- Failure path: refund contributors, split deposit (50% admin / 50% creator), close to creator
+- App self-closes when done.
 
-## Features
+## Files
 
-- Tracks per-investor contributions in **local state** (investor must opt-in).
-- Accepts contributions (ALGO) and holds the project ASA in the **Application Address**.
-- On success (goal reached before deadline):
-  - Pays **2% admin fee** to the admin wallet.
-  - Pays the remainder of ALGO to the developer.
-  - **Returns the developer's 2% deposit**.
-  - Investors can **claim ASA** at a fixed rate (`tokens_per_algo`).
-- On failure (after deadline without reaching goal):
-  - Investors can **refund** their ALGO.
-  - The developer can **reclaim the ASA**.
-  - The **developer/admin split the original deposit 50/50**.
-- Uses **inner transactions**; fees are pooled from the app call txns.
-
-> Note: The app requires enough minimum balance (for holding ALGO and ASA). Fund the app address accordingly at bootstrap.
-
-## Contract Summary
-
-Global state:
-- `admin` (bytes) — admin address
-- `dev` (bytes) — developer address
-- `goal` (uint) — funding goal in microAlgos
-- `deadline` (uint) — unix timestamp (seconds)
-- `asa_id` (uint) — project ASA ID
-- `rate` (uint) — tokens per 1 ALGOs (i.e., per 1_000_000 microAlgos)
-- `raised` (uint) — sum of contributions (microAlgos)
-- `finalized` (uint) — 0 (open), 1 (success), 2 (failed)
-- `deposit` (uint) — developer 2% deposit (microAlgos)
-- `required_pool` (uint) — tokens required if fully funded: `goal * rate / 1_000_000`
-
-Local state (per investor):
-- `contributed` (uint)
-- `claimed` (uint, 0/1)
-
-## Methods
-
-- `create(admin, dev, goal, duration_secs, asa_id, rate)` — **ApplicationCreate** (grouped with a developer deposit Payment to the app address). `duration_secs` should be `60 * 24 * 60 * 60` for 60 days.
-- `bootstrap()` — App-call first in a group to **opt-in** the ASA by inner tx, then expect a **developer ASA transfer** to the app address in the next group transaction for **at least** `required_pool`.
-- `contribute()` — Group of 2: [0] payment from investor to app, [1] app call. Requires investor already **OptIn**'d to the app.
-- `finalize_success()` — When `raised >= goal` and before deadline; pays admin fee (2%), pays remainder + returns the full developer **deposit**.
-- `claim()` — After success finalize; investor transfers ASA owed = `contributed * rate / 1_000_000` and marks as claimed.
-- `refund()` — After deadline and not funded; returns investor's contribution and marks as claimed.
-- `close_fail()` — After deadline and not funded; splits developer deposit 50/50 to developer and admin, and sets `finalized=2`.
-- `reclaim_asa()` — After failure `finalized=2`; sends all ASA back to developer.
-
-All methods enforce **fee pooling**: callers must set a sufficient fee on the app call (multiples of `Global.min_txn_fee()`), as asserted by the contract.
-
-## Test (Fully Funded Case)
-
-The test script in `tests/test_full_funding.py`:
-1. Creates admin, developer, and two investor accounts.
-2. Creates a project ASA.
-3. Deploys the app with a 60-day deadline.
-4. Bootsraps (ASA opt-in + transfer required pool).
-5. Investors opt-in and contribute (6 ALGO + 4 ALGO).
-6. Finalizes success; verifies:
-   - Admin got 2% of total raised.
-   - Developer got the remainder + their returned deposit.
-7. Investors `claim()` their ASA at the configured exchange rate.
-
-> Configure endpoints with environment variables or edit the constants at the top of the script. The test assumes a local node (e.g., Sandbox or AlgoKit LocalNet) and **funded** accounts.
+- `crowdfunding_contract.py` — PyTeal approval/clear programs
+- `deploy.py` — compile, deploy, create ASA, and run setup (deposit + ASA seed)
+- `test_funded.py` — integration test for the **fully funded** case using your provided mnemonics
 
 ## Quick Start
 
-1. **Install deps**
+1. **Install deps (Python 3.10+)**
+
 ```bash
-pip install pyteal==0.24.1 py-algorand-sdk==2.7.0
-```
-2. **Compile contract**
-```bash
-python scripts/compile.py
-```
-3. **Run the test (local node)**
-```bash
-python tests/test_full_funding.py
+python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+pip install pyteal==0.24.1 py-algorand-sdk==2.6.2
 ```
 
-## Groups and Fees
+2. **Run the funded test** (uses TestNet public Algonode endpoints)
 
-- **Create**: Group size 2. [0] Payment (developer → app addr) **≥ deposit**, [1] AppCreate.
-- **Bootstrap**: Group size 2. [0] AppCall `bootstrap`, [1] AssetTransfer (developer → app addr) **≥ required_pool`**.
-- **Contribute**: Group size 2. [0] Payment (investor → app addr), [1] AppCall `contribute` from investor; ensure investor opted-in.
-- **Finalize**: Single AppCall; must pay fee for 2 inner payments.
-- **Claim/Refund**: Single AppCall; must pay fee for 1 inner transaction.
+```bash
+python test_funded.py
+```
 
-Make sure the app call txn fee covers the number of inner transactions the method will execute, i.e.:
-- `finalize_success`: `Txn.fee >= 2 * Global.min_txn_fee()`
-- `claim`/`refund`: `Txn.fee >= Global.min_txn_fee()`
-- `close_fail`: `Txn.fee >= 2 * Global.min_txn_fee()`
+This will:
 
-## Security Notes
+- Create an ASA (decimals 0) sized to `rate * goal`
+- Deploy the app with:
+  - `goal=10 ALGO`
+  - `rate=100 ASA / ALGO`
+  - `deadline≈60 days` (round-based)
+- Perform `setup` (creator deposit=2% and seed ASA to app)
+- Investor 1 contributes **6 ALGO**, Investor 2 contributes **4 ALGO**
+- `finalize` distributes ASA to both investors, pays admin 2%, and **closes** account balances.
 
-- Only **developer** or **admin** can call certain maintenance methods (`close_fail`, `reclaim_asa`) where appropriate.
-- The contract performs strict **group structure checks**.
-- The app treats `rate` as tokens per **1 ALGO**, not per microAlgo, to avoid precision blowups.
+3. **What you can tweak**
 
-You may tune these to your exact product and UI flows.
+- In `test_funded.py`, edit the `ProjectConfig` or contribution amounts.
+- Use a real ASA by setting `asa_id` in `setup` path if you prefer. Current code **creates** a fresh ASA for the demo.
+
+## Notes and Constraints
+
+- **Accounts Limit:** Finalization/refund loops over `Txn.accounts`. Pass all investors you want to settle in each call. Multiple calls are allowed; once `raised==0`, the app self-closes.
+- **Rounding:** `tokens = (contribution_microalgos * rate) / 1_000_000`. Fractional parts are truncated.
+- **Fees:** The outer AppCall must include extra fee to cover **inner transactions** (we set flat fees in scripts).
+- **Deadline:** Implemented as **round-based** (~3.7s/round estimate).
+
+## Security & Production Considerations
+
+- Add checks to prevent over-funding if not desired.
+- Consider an explicit allowlist of investors if you need KYC/AML gates.
+- In production, handle edge cases (dust balances, zero rates, non-opted investors).
+- For many investors, prefer a **"claim"** method instead of passing all in `accounts`.
+
+---
+
+Public endpoints used:
+- Algod: `https://testnet-api.algonode.cloud`
+- Indexer: `https://testnet-idx.algonode.cloud`
