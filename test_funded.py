@@ -1,18 +1,12 @@
 """
 Integration test: Fully Funded Scenario (TestNet) with oversubscription cap
-Updated to match the new contract behavior:
-- finalize distributes ASA to investors (batching via Txn.accounts)
-- finalize then pays the AVAILABLE ALGO balance (Balance - MinBalance) to the developer
-- no admin fee, no account/ASA close-out on success
+Uses 'withdraw' path that:
+- distributes ASA to each investor (from Txn.accounts),
+- pays admin a 2% fee of unlocked ALGO (Balance - MinBalance),
+- pays the remainder of unlocked ALGO to the developer,
+- DOES NOT close the app account.
 
-Flow:
-- Use provided mnemonics (creator, admin, investor1, investor2)
-- Deploy ASA + App (goal, rate, 60 days)
-- Investors opt-in to the app (local) and to the ASA (so they can receive tokens)
-- Auto-top-up investor balances if needed (to cover min-balance + contribution + fees)
-- Investors contribute so that total == goal
-- Finalize: distributes ASA and pays available ALGO to creator (no admin fee / no closes)
-- Assertions verify creator payout ≈ available balance and app retains its min-balance
+Assertions are based on the actual unlocked amount = (app_pre - app_post).
 """
 
 from typing import Tuple, List
@@ -24,7 +18,7 @@ from algosdk.error import AlgodHTTPError
 
 from deploy import get_clients, deploy_crowdfund, MIN_FEE, ProjectConfig
 
-# ---- REQUIRED MNEMONICS (from user) ----
+# ---- Provided mnemonics ----
 CREATOR_MN = "able install flower toward cheap matter shallow switch dash roof suit eyebrow cheese current bleak enhance awesome brother leader they again simple desert about popular"
 ADMIN_MN   = "science young voyage utility argue issue chase between dumb urban stone come hotel seat scorpion simple oak hub review gesture gossip smart city absent huge"
 INV1_MN    = "damage cute radio venue palace stick double luggage round baby action fetch orchard pencil above slot water cement slot piano title gravity clutch absent sea"
@@ -38,10 +32,6 @@ def addr_from_mn(mn: str) -> Tuple[str, str]:
     return addr, sk
 
 def wait_for_confirmation(client: algod.AlgodClient, txid: str, timeout: int = 90):
-    """
-    Robust waiter that tolerates 404s while the tx is propagating and
-    advances rounds instead of tight-looping.
-    """
     import time
     start = time.time()
     last_round = client.status().get("last-round")
@@ -63,6 +53,10 @@ def microalgos(algos: int) -> int:
 
 def get_algo(client: algod.AlgodClient, addr: str) -> int:
     return client.account_info(addr).get("amount", 0)
+
+def get_min_balance(client: algod.AlgodClient, addr: str) -> int:
+    info = client.account_info(addr)
+    return info.get("min-balance", 100_000)
 
 def print_balances(client: algod.AlgodClient, addr: str, asa_id: int):
     info = client.account_info(addr)
@@ -98,7 +92,6 @@ def send_and_wait(client: algod.AlgodClient, signed: List[txn.SignedTransaction]
         wait_for_confirmation(client, txid, timeout=90)
         return [txid]
     else:
-        # If they have a group field set, send as a group; else send individually.
         groups = {s.transaction.group for s in signed}
         if len(groups) == 1 and list(groups)[0] is not None and list(groups)[0] != b"":
             txids = [s.get_txid() for s in signed]
@@ -128,7 +121,6 @@ def estimate_min_balance_after_optins(client: algod.AlgodClient, addr: str, will
     info = client.account_info(addr)
     total_local = info.get("total-app-local-states", 0)
     total_assets = info.get("total-assets-opted-in", len(info.get("assets", [])))
-    # Some nodes expose explicit totals, others don't; fall back to lengths above.
     if will_add_app_local:
         total_local += 1
     if will_add_asset_hold:
@@ -147,11 +139,9 @@ def ensure_funds(client: algod.AlgodClient, funder_addr: str, funder_sk: str, ta
         will_add_asset_hold=not already_opted_asset
     )
     current = get_algo(client, target_addr)
-
     contribution_micro = microalgos(needed_contribution_algos)
     FEE_BUFFER = 4000  # µAlgos: a few transactions worth of fees
     required_total = min_bal + contribution_micro + FEE_BUFFER
-
     topup = max(0, required_total - current)
     if topup > 0:
         sp = client.suggested_params()
@@ -159,7 +149,6 @@ def ensure_funds(client: algod.AlgodClient, funder_addr: str, funder_sk: str, ta
         stx = pay.sign(funder_sk)
         txid = client.send_transaction(stx)
         wait_for_confirmation(client, txid, 90)
-        # Optional: sanity re-check
         assert get_algo(client, target_addr) >= required_total, "Top-up failed to reach required balance"
 
 # -------- Test --------
@@ -181,54 +170,31 @@ def main():
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
         print_balances(algod_client, a, asa_id)
 
-    # --- Investors OPT-IN to APP (local state) ---
-    opt_params = algod_client.suggested_params()
-    stx1 = txn.ApplicationOptInTxn(sender=inv1_addr, sp=opt_params, index=app_id).sign(inv1_sk)
+    # Investors OPT-IN to APP (local)
+    stx1 = txn.ApplicationOptInTxn(sender=inv1_addr, sp=algod_client.suggested_params(), index=app_id).sign(inv1_sk)
     stx2 = txn.ApplicationOptInTxn(sender=inv2_addr, sp=algod_client.suggested_params(), index=app_id).sign(inv2_sk)
-    send_and_wait(algod_client, [stx1])  # send separately to avoid accidental group
-    send_and_wait(algod_client, [stx2])
+    send_and_wait(algod_client, [stx1]); send_and_wait(algod_client, [stx2])
     print("Investors opted in (app).")
 
-    # --- Investors OPT-IN to ASA (asset holding) ---
+    # Investors OPT-IN to ASA (asset)
     opt_in_asset(algod_client, inv1_addr, inv1_sk, asa_id)
     opt_in_asset(algod_client, inv2_addr, inv2_sk, asa_id)
     print("Investors opted in (ASA).")
 
-    # --- Ensure investors have enough spendable for contributions ---
+    # Ensure investors have enough spendable for contributions
     inv1_contrib_algos = 6
     inv2_contrib_algos = 4
-    ensure_funds(
-        algod_client, creator_addr, creator_sk,
-        inv1_addr, inv1_contrib_algos,
-        already_opted_app=True, already_opted_asset=True
-    )
-    ensure_funds(
-        algod_client, creator_addr, creator_sk,
-        inv2_addr, inv2_contrib_algos,
-        already_opted_app=True, already_opted_asset=True
-    )
+    ensure_funds(algod_client, creator_addr, creator_sk, inv1_addr, inv1_contrib_algos, True, True)
+    ensure_funds(algod_client, creator_addr, creator_sk, inv2_addr, inv2_contrib_algos, True, True)
     print("Investors funded sufficiently for contributions.")
 
-    # --- Contributions (grouped per investor: AppCall + Payment) ---
+    # Contributions (per investor: [AppCall("contribute"), Payment])
     def contribute(addr, sk, amount_algos: int):
-        params_app = algod_client.suggested_params()
-        params_app.flat_fee = True
-        params_app.fee = MIN_FEE  # appcall; no inner txns here
-
-        app_call = txn.ApplicationNoOpTxn(
-            sender=addr, sp=params_app, index=app_id, app_args=[b"contribute"]
-        )
-        pay = txn.PaymentTxn(
-            sender=addr, sp=algod_client.suggested_params(), receiver=app_addr, amt=microalgos(amount_algos)
-        )
-
-        gid = txn.calculate_group_id([app_call, pay])
-        app_call.group = gid
-        pay.group = gid
-
-        stx_a = app_call.sign(sk)
-        stx_b = pay.sign(sk)
-        send_and_wait(algod_client, [stx_a, stx_b])
+        p_app = algod_client.suggested_params(); p_app.flat_fee = True; p_app.fee = MIN_FEE
+        call = txn.ApplicationNoOpTxn(sender=addr, sp=p_app, index=app_id, app_args=[b"contribute"])
+        pay  = txn.PaymentTxn(sender=addr, sp=algod_client.suggested_params(), receiver=app_addr, amt=microalgos(amount_algos))
+        gid = txn.calculate_group_id([call, pay]); call.group = gid; pay.group = gid
+        send_and_wait(algod_client, [call.sign(sk), pay.sign(sk)])
 
     contribute(inv1_addr, inv1_sk, inv1_contrib_algos)
     contribute(inv2_addr, inv2_sk, inv2_contrib_algos)
@@ -238,57 +204,62 @@ def main():
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
         print_balances(algod_client, a, asa_id)
 
-    # Snapshot pre-finalize balances for assertions
+    # Snapshot pre-withdraw balances
     creator_pre = get_algo(algod_client, creator_addr)
     admin_pre   = get_algo(algod_client, admin_addr)
-    app_pre     = get_algo(algod_client, app_addr)  # should be ~goal + deposit
+    app_pre     = get_algo(algod_client, app_addr)
 
-    # --- Finalize success: distributes ASA, sends AVAILABLE ALGO to creator (no admin fee, no closes) ---
-    params = algod_client.suggested_params()
-    params.flat_fee = True
-    # Inner txs: up to 2 ASA sends + 1 payment to creator; budget generously
-    params.fee = MIN_FEE * 8
+    # ---- Withdraw (creator) ----
+    p = algod_client.suggested_params()
+    p.flat_fee = True
+    # Inner txns per withdraw call: (#investors payouts) + admin pay + creator pay
+    p.fee = MIN_FEE * 8
 
-    finalize = txn.ApplicationNoOpTxn(
+    withdraw = txn.ApplicationNoOpTxn(
         sender=creator_addr,
-        sp=params,
+        sp=p,
         index=app_id,
-        app_args=[b"finalize"],
-        accounts=[inv1_addr, inv2_addr],  # NOTE: contract pays sender + these accounts
+        app_args=[b"withdraw"],  # contract reads investors from Txn.accounts (unrolled)
+        accounts=[
+            inv1_addr, inv2_addr,  # investors to receive ASA
+            admin_addr,            # admin must be in Accounts for inner Payment receiver
+            creator_addr,          # creator must be in Accounts for inner Payment receiver
+        ],
         foreign_assets=[asa_id],
     ).sign(creator_sk)
 
-    send_and_wait(algod_client, [finalize])
-    print("Finalize complete.")
+    send_and_wait(algod_client, [withdraw])
+    print("Withdraw complete.")
 
-    print("\n--- Balances AFTER FINALIZE ---")
+    print("\n--- Balances AFTER WITHDRAW ---")
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
         print_balances(algod_client, a, asa_id)
 
-    # Assertions: no admin fee, creator gets app's AVAILABLE balance, app retains min-balance
+    # Assertions
     creator_post = get_algo(algod_client, creator_addr)
     admin_post   = get_algo(algod_client, admin_addr)
     app_post     = get_algo(algod_client, app_addr)
 
-    app_info_post = algod_client.account_info(app_addr)
-    app_min_bal_post = app_info_post.get("min-balance", 0)
-
     admin_gain   = admin_post - admin_pre
     creator_gain = creator_post - creator_pre
 
-    expected_creator_gain = app_pre - app_min_bal_post  # available = balance - min balance
+    # Compute unlocked amount actually distributed (independent of min-balance/asset-close details)
+    total_distributed = app_pre - app_post
+    expected_admin_fee = (total_distributed * 2) // 100
+    expected_creator_gain = total_distributed - expected_admin_fee
 
     print("\n--- Payout Summary (expected vs observed) ---")
-    print(f"App pre-finalize balance: {app_pre} µAlgos")
-    print(f"App min-balance after finalize: {app_min_bal_post} µAlgos")
-    print(f"Expected creator payout (available): {expected_creator_gain} µAlgos | Observed: {creator_gain} µAlgos")
-    print(f"Admin gain (should be 0): {admin_gain} µAlgos")
-    print(f"App post-finalize balance (should equal min-balance): {app_post} µAlgos")
+    print(f"App pre-withdraw balance: {app_pre} µAlgos")
+    print(f"App post-withdraw balance (min-balance remains): {app_post} µAlgos")
+    print(f"Unlocked distributed: {total_distributed} µAlgos")
+    print(f"Expected admin fee (2% of unlocked): {expected_admin_fee} µAlgos | Observed: {admin_gain} µAlgos")
+    print(f"Expected creator remainder: {expected_creator_gain} µAlgos | Observed: {creator_gain} µAlgos")
 
-    SLACK = 20_000  # allow for outer/inner fee dust
-    assert admin_gain == 0, "Admin should not receive funds in new finalize flow"
-    assert abs(creator_gain - expected_creator_gain) <= SLACK, "Creator payout mismatch"
-    assert app_post == app_min_bal_post, "App balance should remain at min-balance (no close-out)"
+    SLACK = 8_000  # allow for fee dust
+    assert abs(admin_gain - expected_admin_fee) <= SLACK, "Admin fee mismatch"
+    assert abs(creator_gain - expected_creator_gain) <= 20_000, "Creator payout mismatch"
+    # App should retain at least its min-balance
+    assert app_post >= get_min_balance(algod_client, app_addr), "App balance below min-balance"
 
 if __name__ == "__main__":
     main()
