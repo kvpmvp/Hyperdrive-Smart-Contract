@@ -263,5 +263,30 @@ def main():
     # App should retain at least its min-balance
     assert app_post >= get_min_balance(algod_client, app_addr), "App balance below min-balance"
 
+    # ---- Close the vault (success path) ----
+    # Provide foreign_assets and accounts so AssetHolding.* can read the app's ASA holding.
+    p_close = algod_client.suggested_params()
+    p_close.flat_fee = True
+    p_close.fee = MIN_FEE * 4  # cover inner payment (+ optional ASA close-out)
+
+    close_vault = txn.ApplicationNoOpTxn(
+        sender=creator_addr,
+        sp=p_close,
+        index=app_id,
+        app_args=[b"close_vault"],
+        accounts=[app_addr],       # make app account available
+        foreign_assets=[asa_id],   # make ASA available
+    ).sign(creator_sk)
+
+    send_and_wait(algod_client, [close_vault])
+    print("close_vault executed (success path). App account should now be emptied and closed if holdings were zero.")
+
+    # Optional: Try to fetch app account; it may be gone (node may return an error if fully closed).
+    try:
+        info = algod_client.account_info(app_addr)
+        print(f"Post-close_vault app balance: {info.get('amount', 0)} µAlgos, min-balance={info.get('min-balance', 0)}")
+    except Exception as e:
+        print(f"App account likely closed (lookup failed): {e}")
+
 if __name__ == "__main__":
     main()

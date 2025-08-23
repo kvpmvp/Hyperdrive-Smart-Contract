@@ -4,6 +4,7 @@ Unfunded path integration test (TestNet, ~2 minutes):
 - Make partial contributions (sum < goal)
 - Wait past deadline, then investors call "refund"
 - Optionally, creator calls "reclaim" (deposit split; may be limited by min-balance)
+- Finally, creator closes the vault (sweep ASA holding and close ALGO)
 
 Also asserts the deposit is present before contributions (new deposit guard).
 """
@@ -276,6 +277,62 @@ def main():
     refund(inv1_addr, inv1_sk)
     refund(inv2_addr, inv2_sk)
     print("Investors refunded.")
+
+    # ---- NEW: Creator reclaims deposit (one-time), sweeps ASA holding, then closes the vault ----
+    # Contract gates:
+    # - reclaim: after_deadline, funded==0, creator, raised==0, deposit>0
+    # - sweep_asa_failed: after_deadline, funded==0, creator, raised==0
+    # - close_vault (failure branch): after_deadline, raised==0, deposit==0 (reclaim done). Also ensures ASA holding is closed.
+    # Fees below are conservative to cover inner transactions.
+    print("\nCreator reclaiming deposit...")
+    p_reclaim = algod_client.suggested_params()
+    p_reclaim.flat_fee = True
+    p_reclaim.fee = MIN_FEE * 5  # two inner payments (admin + creator)
+    reclaim_call = txn.ApplicationNoOpTxn(
+        sender=creator_addr,
+        sp=p_reclaim,
+        index=app_id,
+        app_args=[b"reclaim"],
+        accounts=[admin_addr],  # optional; receivers are set in inner tx; included for clarity
+    ).sign(creator_sk)
+    send_and_wait(algod_client, [reclaim_call])
+    print("reclaim complete.")
+
+    print("Sweeping ASA back to creator (failed path)...")
+    p_sweep = algod_client.suggested_params()
+    p_sweep.flat_fee = True
+    p_sweep.fee = MIN_FEE * 3  # inner asset close-out
+    sweep_call = txn.ApplicationNoOpTxn(
+        sender=creator_addr,
+        sp=p_sweep,
+        index=app_id,
+        app_args=[b"sweep_asa_failed"],
+        foreign_assets=[asa_id],  # not strictly required for inner xfer, but harmless
+    ).sign(creator_sk)
+    send_and_wait(algod_client, [sweep_call])
+    print("sweep_asa_failed complete.")
+
+    print("Closing vault (failure path)...")
+    p_close = algod_client.suggested_params()
+    p_close.flat_fee = True
+    p_close.fee = MIN_FEE * 4  # inner payment with close_remainder_to (+ safety)
+    close_vault = txn.ApplicationNoOpTxn(
+        sender=creator_addr,
+        sp=p_close,
+        index=app_id,
+        app_args=[b"close_vault"],
+        accounts=[app_addr],       # needed for AssetHolding.balance(app_addr, asa_id)
+        foreign_assets=[asa_id],   # make ASA available to TEAL for AssetHolding.*
+    ).sign(creator_sk)
+    send_and_wait(algod_client, [close_vault])
+    print("close_vault executed. App account should now be emptied/closed.")
+
+    # Optional: Check app account (may error if fully closed)
+    try:
+        info = algod_client.account_info(app_addr)
+        print(f"Post-close_vault app balance: {info.get('amount', 0)} µAlgos, min-balance={info.get('min-balance', 0)}")
+    except Exception as e:
+        print(f"App account likely closed (lookup failed): {e}")
 
     print("\nUNFUNDED TEST COMPLETE ✅")
 
