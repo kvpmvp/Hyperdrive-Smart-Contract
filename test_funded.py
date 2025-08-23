@@ -1,12 +1,11 @@
 """
-Integration test: Fully Funded Scenario (TestNet) with oversubscription cap
-Uses 'withdraw' path that:
-- distributes ASA to each investor (from Txn.accounts),
-- pays admin a 2% fee of unlocked ALGO (Balance - MinBalance),
-- pays the remainder of unlocked ALGO to the developer,
-- DOES NOT close the app account.
+Integration test: Fully Funded Scenario (TestNet) with investor-initiated claims.
+After funding:
+- each investor calls "claim" to receive ASA
+- creator calls "withdraw" to receive unlocked ALGO minus 2% to admin
+- app account remains open (no closing)
 
-Assertions are based on the actual unlocked amount = (app_pre - app_post).
+Assertions are based on actual unlocked amount distributed.
 """
 
 from typing import Tuple, List
@@ -170,10 +169,11 @@ def main():
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
         print_balances(algod_client, a, asa_id)
 
-    # Investors OPT-IN to APP (local)
-    stx1 = txn.ApplicationOptInTxn(sender=inv1_addr, sp=algod_client.suggested_params(), index=app_id).sign(inv1_sk)
-    stx2 = txn.ApplicationOptInTxn(sender=inv2_addr, sp=algod_client.suggested_params(), index=app_id).sign(inv2_sk)
-    send_and_wait(algod_client, [stx1]); send_and_wait(algod_client, [stx2])
+    # Investors OPT-IN to APP (local) — send individually (NOT as a group)
+    opt1 = txn.ApplicationOptInTxn(sender=inv1_addr, sp=algod_client.suggested_params(), index=app_id)
+    opt2 = txn.ApplicationOptInTxn(sender=inv2_addr, sp=algod_client.suggested_params(), index=app_id)
+    send_and_wait(algod_client, [opt1.sign(inv1_sk)])
+    send_and_wait(algod_client, [opt2.sign(inv2_sk)])
     print("Investors opted in (app).")
 
     # Investors OPT-IN to ASA (asset)
@@ -204,32 +204,40 @@ def main():
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
         print_balances(algod_client, a, asa_id)
 
-    # Snapshot pre-withdraw balances
+    # Investors claim ASA
+    def claim(addr, sk):
+        p = algod_client.suggested_params(); p.flat_fee = True; p.fee = MIN_FEE * 3
+        call = txn.ApplicationNoOpTxn(
+            sender=addr, sp=p, index=app_id,
+            app_args=[b"claim"],
+            foreign_assets=[asa_id],
+        ).sign(sk)
+        send_and_wait(algod_client, [call])
+
+    claim(inv1_addr, inv1_sk)
+    claim(inv2_addr, inv2_sk)
+    print("Investors claimed ASA.")
+
+    # Snapshot pre-withdraw balances for creator/admin/app
     creator_pre = get_algo(algod_client, creator_addr)
     admin_pre   = get_algo(algod_client, admin_addr)
     app_pre     = get_algo(algod_client, app_addr)
 
-    # ---- Withdraw (creator) ----
+    # ---- Creator withdraw ----
     p = algod_client.suggested_params()
     p.flat_fee = True
-    # Inner txns per withdraw call: (#investors payouts) + admin pay + creator pay
-    p.fee = MIN_FEE * 8
-
+    p.fee = MIN_FEE * 6  # inner payments: admin + creator (+ fees safety)
     withdraw = txn.ApplicationNoOpTxn(
         sender=creator_addr,
         sp=p,
         index=app_id,
-        app_args=[b"withdraw"],  # contract reads investors from Txn.accounts (unrolled)
-        accounts=[
-            inv1_addr, inv2_addr,  # investors to receive ASA
-            admin_addr,            # admin must be in Accounts for inner Payment receiver
-            creator_addr,          # creator must be in Accounts for inner Payment receiver
-        ],
-        foreign_assets=[asa_id],
+        app_args=[b"withdraw"],
+        accounts=[admin_addr],   # admin must be available to inner Payment
+        foreign_assets=[asa_id], # not strictly needed here unless you add ASA consolidation
     ).sign(creator_sk)
 
     send_and_wait(algod_client, [withdraw])
-    print("Withdraw complete.")
+    print("Creator withdraw complete.")
 
     print("\n--- Balances AFTER WITHDRAW ---")
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:

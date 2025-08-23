@@ -9,12 +9,10 @@ KEY_RAISED   = Bytes("raised")
 KEY_DEPOSIT  = Bytes("deposit")
 KEY_CREATOR  = Bytes("creator")
 KEY_ADMIN    = Bytes("admin")
+KEY_FUNDED   = Bytes("funded")  # 0 or 1
 
 # --------- Local keys ----------
 LKEY_CONTRIB = Bytes("contrib")
-
-# How many foreign accounts (investors) to process per call (unrolled)
-MAX_ACCOUNTS = 8
 
 def approval_program():
     # ----- On create -----
@@ -28,11 +26,11 @@ def approval_program():
         App.globalPut(KEY_RAISED,  Int(0)),
         App.globalPut(KEY_ASA,     Int(0)),
         App.globalPut(KEY_DEPOSIT, Int(0)),
+        App.globalPut(KEY_FUNDED,  Int(0)),
         Approve(),
     )
 
     # ----- Common symbols -----
-    app_id   = Global.current_application_id()
     app_addr = Global.current_application_address()
     goal     = App.globalGet(KEY_GOAL)
     rate     = App.globalGet(KEY_RATE)
@@ -41,18 +39,20 @@ def approval_program():
     deposit  = App.globalGet(KEY_DEPOSIT)
     creator  = App.globalGet(KEY_CREATOR)
     admin    = App.globalGet(KEY_ADMIN)
+    funded   = App.globalGet(KEY_FUNDED)
 
     is_creator      = Txn.sender() == creator
     before_deadline = Global.round() <= deadline
     after_deadline  = Global.round() >  deadline
 
     # ----- setup -----
-    # Expect group: [0]=Payment(deposit->app), [1]=AppCall("setup", assets=[asa]), [2]=ASA Transfer(seed->app)
+    # Expect group: [0]=Payment(deposit->app), [1]=AppCall("setup", app_args=["setup", asa_id]), [2]=ASA Transfer(seed->app)
+    setup_asa = Btoi(Txn.application_args[1])  # ASA id passed explicitly as app arg
     expected_deposit = (goal * Int(2)) / Int(100)
     setup = Seq(
         Assert(is_creator),
-        Assert(Txn.assets.length() == Int(1)),
-        App.globalPut(KEY_ASA, Txn.assets[0]),
+        Assert(Txn.application_args.length() == Int(2)),
+        App.globalPut(KEY_ASA, setup_asa),
         Assert(Global.group_size() >= Int(3)),
 
         # deposit first
@@ -66,7 +66,7 @@ def approval_program():
         InnerTxnBuilder.Begin(),
         InnerTxnBuilder.SetFields({
             TxnField.type_enum:      TxnType.AssetTransfer,
-            TxnField.xfer_asset:     Txn.assets[0],
+            TxnField.xfer_asset:     setup_asa,
             TxnField.asset_receiver: app_addr,
             TxnField.asset_amount:   Int(0),
         }),
@@ -76,7 +76,7 @@ def approval_program():
         Assert(Gtxn[2].type_enum()      == TxnType.AssetTransfer),
         Assert(Gtxn[2].sender()         == Txn.sender()),
         Assert(Gtxn[2].asset_receiver() == app_addr),
-        Assert(Gtxn[2].xfer_asset()     == Txn.assets[0]),
+        Assert(Gtxn[2].xfer_asset()     == setup_asa),
         Assert(Gtxn[2].asset_amount()   >= (goal * rate) / Int(1_000_000)),
         Approve()
     )
@@ -97,90 +97,65 @@ def approval_program():
         App.localPut(investor, LKEY_CONTRIB,
                      App.localGet(investor, LKEY_CONTRIB) + Gtxn[1].amount()),
         App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) + Gtxn[1].amount()),
+        # If we just reached the goal, latch funded
+        If(App.globalGet(KEY_RAISED) == goal).Then(App.globalPut(KEY_FUNDED, Int(1))),
         Approve()
     )
 
-    # ----- helpers -----
-    acct        = ScratchVar(TealType.bytes)
+    # ----- claim (investor self-serve ASA) -----
     contrib_amt = ScratchVar(TealType.uint64)
     tokens_due  = ScratchVar(TealType.uint64)
 
-    def payout_one(acct_expr: Expr):
-        """Send ASA to an investor for their contribution and zero it out."""
-        return Seq(
-            contrib_amt.store(App.localGet(acct_expr, LKEY_CONTRIB)),
-            If(contrib_amt.load() > Int(0)).Then(Seq(
-                tokens_due.store((contrib_amt.load() * rate) / Int(1_000_000)),
-                If(tokens_due.load() > Int(0)).Then(Seq(
-                    InnerTxnBuilder.Begin(),
-                    InnerTxnBuilder.SetFields({
-                        TxnField.type_enum:      TxnType.AssetTransfer,
-                        TxnField.xfer_asset:     asa_id,
-                        TxnField.asset_receiver: acct_expr,
-                        TxnField.asset_amount:   tokens_due.load(),
-                    }),
-                    InnerTxnBuilder.Submit(),
-                )),
-                App.localPut(acct_expr, LKEY_CONTRIB, Int(0)),
-                App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) - contrib_amt.load()),
-            ))
-        )
+    claim = Seq(
+        Assert(funded == Int(1)),             # project is funded (latched)
+        Assert(Txn.assets.length() >= Int(1)),
+        Assert(Txn.assets[0] == asa_id),
+        contrib_amt.store(App.localGet(Txn.sender(), LKEY_CONTRIB)),
+        Assert(contrib_amt.load() > Int(0)),
+        tokens_due.store((contrib_amt.load() * rate) / Int(1_000_000)),
+        # send ASA to the caller
+        If(tokens_due.load() > Int(0)).Then(Seq(
+            InnerTxnBuilder.Begin(),
+            InnerTxnBuilder.SetFields({
+                TxnField.type_enum:      TxnType.AssetTransfer,
+                TxnField.xfer_asset:     asa_id,
+                TxnField.asset_receiver: Txn.sender(),
+                TxnField.asset_amount:   tokens_due.load(),
+            }),
+            InnerTxnBuilder.Submit(),
+        )),
+        # zero out their contrib and decrement raised
+        App.localPut(Txn.sender(), LKEY_CONTRIB, Int(0)),
+        App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) - contrib_amt.load()),
+        Approve()
+    )
 
-    def refund_one(acct_expr: Expr):
-        """Refund ALGO contribution to an investor and zero it out."""
-        return Seq(
-            contrib_amt.store(App.localGet(acct_expr, LKEY_CONTRIB)),
-            If(contrib_amt.load() > Int(0)).Then(Seq(
-                InnerTxnBuilder.Begin(),
-                InnerTxnBuilder.SetFields({
-                    TxnField.type_enum: TxnType.Payment,
-                    TxnField.receiver:  acct_expr,
-                    TxnField.amount:    contrib_amt.load(),
-                }),
-                InnerTxnBuilder.Submit(),
-                App.localPut(acct_expr, LKEY_CONTRIB, Int(0)),
-                App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) - contrib_amt.load()),
-            ))
-        )
-
-    # Unrolled handler for foreign account at constant idx
-    def handle_account_at(idx: int, body_fn):
-        return If(Txn.accounts.length() > Int(idx)).Then(
-            Seq(
-                acct.store(Txn.accounts[idx]),
-                If(App.optedIn(acct.load(), app_id)).Then(body_fn(acct.load()))
-            )
-        )
-
-    def unrolled_for_accounts(body_fn):
-        seqs = []
-        for k in range(MAX_ACCOUNTS):
-            seqs.append(handle_account_at(k, body_fn))
-        return Seq(*seqs) if len(seqs) > 0 else Approve()
-
-    # ----- withdraw (success path; does NOT close app) -----
-    # - only creator
-    # - require raised >= goal (funded)
-    # - process up to MAX_ACCOUNTS investors from Txn.accounts
-    # - pay admin 2% of UNLOCKED (Balance - MinBalance), dev gets rest
-    # - leave account open
+    # ----- withdraw (creator ALGO payout, admin 2%) -----
     unlocked   = ScratchVar(TealType.uint64)
     admin_fee  = ScratchVar(TealType.uint64)
     to_creator = ScratchVar(TealType.uint64)
 
+    # Allow withdraw if: funded latched, OR (raised==goal), OR (raised==0 after all claims)
+    can_withdraw = Or(
+        App.globalGet(KEY_FUNDED) == Int(1),
+        App.globalGet(KEY_RAISED) == App.globalGet(KEY_GOAL),
+        App.globalGet(KEY_RAISED) == Int(0),
+    )
+
     withdraw = Seq(
         Assert(is_creator),
-        Assert(App.globalGet(KEY_RAISED) >= goal),
+        Assert(can_withdraw),
 
-        # distribute ASA to provided investors (constant-indexed unroll)
-        unrolled_for_accounts(payout_one),
+        # Admin must be provided in foreign accounts to satisfy AVM account availability
+        Assert(Txn.accounts.length() >= Int(1)),
+        # NOTE: We *don't* assert Txn.accounts[0] == admin; the receiver below comes from global state.
 
-        # compute unlocked = Balance - MinBalance (do NOT close account)
+        # compute unlocked = Balance - MinBalance (leave account open)
         unlocked.store(Balance(app_addr) - MinBalance(app_addr)),
         admin_fee.store((unlocked.load() * Int(2)) / Int(100)),
         to_creator.store(unlocked.load() - admin_fee.load()),
 
-        # pay admin fee
+        # pay admin (to the address stored in global state)
         If(admin_fee.load() > Int(0)).Then(Seq(
             InnerTxnBuilder.Begin(),
             InnerTxnBuilder.SetFields({
@@ -191,7 +166,7 @@ def approval_program():
             InnerTxnBuilder.Submit(),
         )),
 
-        # pay remainder to creator
+        # pay creator (sender)
         If(to_creator.load() > Int(0)).Then(Seq(
             InnerTxnBuilder.Begin(),
             InnerTxnBuilder.SetFields({
@@ -201,37 +176,45 @@ def approval_program():
             }),
             InnerTxnBuilder.Submit(),
         )),
-
         Approve()
     )
 
-    # ----- refund (failure path; does NOT close app) -----
-    # After deadline and not funded: refund investors provided in Txn.accounts.
-    # Then split deposit 50/50 between admin and creator, but capped to the unlocked balance.
+    # ----- refund (investor self-serve ALGO) -----
+    refund = Seq(
+        Assert(after_deadline),
+        Assert(App.globalGet(KEY_FUNDED) == Int(0)),
+        contrib_amt.store(App.localGet(Txn.sender(), LKEY_CONTRIB)),
+        Assert(contrib_amt.load() > Int(0)),
+        InnerTxnBuilder.Begin(),
+        InnerTxnBuilder.SetFields({
+            TxnField.type_enum: TxnType.Payment,
+            TxnField.receiver:  Txn.sender(),
+            TxnField.amount:    contrib_amt.load(),
+        }),
+        InnerTxnBuilder.Submit(),
+        App.localPut(Txn.sender(), LKEY_CONTRIB, Int(0)),
+        App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) - contrib_amt.load()),
+        Approve()
+    )
+
+    # Optional: creator can reclaim deposit halves after failure (admin must be in accounts[0])
     half        = ScratchVar(TealType.uint64)
     pay_admin   = ScratchVar(TealType.uint64)
     pay_creator = ScratchVar(TealType.uint64)
 
-    refund = Seq(
+    reclaim = Seq(
         Assert(after_deadline),
-        Assert(App.globalGet(KEY_RAISED) < goal),
-
-        # refund each provided investor
-        unrolled_for_accounts(refund_one),
-
-        # split deposit within what's unlocked
-        unlocked.store(Balance(app_addr) - MinBalance(app_addr)),
+        Assert(App.globalGet(KEY_FUNDED) == Int(0)),
+        Assert(is_creator),
+        Assert(Txn.accounts.length() >= Int(1)),
         half.store(deposit / Int(2)),
-
-        # admin gets min(half, unlocked)
+        unlocked.store(Balance(app_addr) - MinBalance(app_addr)),
         pay_admin.store(If(unlocked.load() < half.load(), unlocked.load(), half.load())),
-        # creator gets min(half, unlocked - pay_admin)
         pay_creator.store(
             If((unlocked.load() - pay_admin.load()) < half.load(),
                unlocked.load() - pay_admin.load(),
                half.load())
         ),
-
         If(pay_admin.load() > Int(0)).Then(Seq(
             InnerTxnBuilder.Begin(),
             InnerTxnBuilder.SetFields({
@@ -250,13 +233,12 @@ def approval_program():
             }),
             InnerTxnBuilder.Submit(),
         )),
-
         Approve()
     )
 
     # ----- other handlers -----
     on_update   = Seq(Reject())
-    on_delete   = Seq(Reject())  # keep app open; avoid delete/close complexities
+    on_delete   = Seq(Reject())  # keep app open
     on_closeout = Seq(Approve())
     on_optin    = Seq(App.localPut(Txn.sender(), LKEY_CONTRIB, Int(0)), Approve())
 
@@ -269,8 +251,10 @@ def approval_program():
         [Txn.on_completion() == OnComplete.NoOp, Cond(
             [Txn.application_args[0] == Bytes("setup"),      setup],
             [Txn.application_args[0] == Bytes("contribute"), contribute],
+            [Txn.application_args[0] == Bytes("claim"),      claim],
             [Txn.application_args[0] == Bytes("withdraw"),   withdraw],
             [Txn.application_args[0] == Bytes("refund"),     refund],
+            [Txn.application_args[0] == Bytes("reclaim"),    reclaim],
         )]
     )
     return program
