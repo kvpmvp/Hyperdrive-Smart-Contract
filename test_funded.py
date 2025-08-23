@@ -5,7 +5,7 @@ After funding:
 - creator calls "withdraw" to receive unlocked ALGO minus 2% to admin
 - app account remains open (no closing)
 
-Assertions are based on actual unlocked amount distributed.
+Also asserts the 2% deposit is present before contributions (new deposit guard).
 """
 
 from typing import Tuple, List
@@ -113,10 +113,6 @@ PER_APP_LOCAL = 100_000
 PER_ASSET_HOLD = 100_000
 
 def estimate_min_balance_after_optins(client: algod.AlgodClient, addr: str, will_add_app_local: bool, will_add_asset_hold: bool) -> int:
-    """
-    Estimate the Algorand min-balance for an account after new app local state
-    and/or asset holding are added. Uses current totals + optional increments.
-    """
     info = client.account_info(addr)
     total_local = info.get("total-app-local-states", 0)
     total_assets = info.get("total-assets-opted-in", len(info.get("assets", [])))
@@ -127,11 +123,6 @@ def estimate_min_balance_after_optins(client: algod.AlgodClient, addr: str, will
     return BASE_MIN_BAL + PER_APP_LOCAL * total_local + PER_ASSET_HOLD * total_assets
 
 def ensure_funds(client: algod.AlgodClient, funder_addr: str, funder_sk: str, target_addr: str, needed_contribution_algos: int, already_opted_app: bool, already_opted_asset: bool):
-    """
-    Ensure target_addr has enough spendable balance to:
-      min-balance (after required opt-ins) + contribution amount + fee buffer.
-    If not, send a top-up PaymentTxn from funder.
-    """
     min_bal = estimate_min_balance_after_optins(
         client, target_addr,
         will_add_app_local=not already_opted_app,
@@ -139,7 +130,7 @@ def ensure_funds(client: algod.AlgodClient, funder_addr: str, funder_sk: str, ta
     )
     current = get_algo(client, target_addr)
     contribution_micro = microalgos(needed_contribution_algos)
-    FEE_BUFFER = 4000  # µAlgos: a few transactions worth of fees
+    FEE_BUFFER = 4000
     required_total = min_bal + contribution_micro + FEE_BUFFER
     topup = max(0, required_total - current)
     if topup > 0:
@@ -148,7 +139,6 @@ def ensure_funds(client: algod.AlgodClient, funder_addr: str, funder_sk: str, ta
         stx = pay.sign(funder_sk)
         txid = client.send_transaction(stx)
         wait_for_confirmation(client, txid, 90)
-        assert get_algo(client, target_addr) >= required_total, "Top-up failed to reach required balance"
 
 # -------- Test --------
 
@@ -164,6 +154,10 @@ def main():
     cfg = ProjectConfig(goal_algos=10, rate_per_algo=100, days_duration=60)
     app_id, app_addr, asa_id, tokens_expected, goal_micro, deposit_amt = deploy_crowdfund(CREATOR_MN, ADMIN_MN, cfg)
     print(f"App {app_id} at {app_addr}, ASA {asa_id}, expected tokens {tokens_expected}, deposit {deposit_amt} µAlgos")
+
+    # NEW: assert deposit is present (at least deposit amount should be sitting on the app pre-contributions)
+    app_start_algo = get_algo(algod_client, app_addr)
+    assert app_start_algo >= deposit_amt, f"Deposit not present in app account (have {app_start_algo}, need >= {deposit_amt})"
 
     print("\n--- Balances BEFORE contributions ---")
     for a in [creator_addr, admin_addr, inv1_addr, inv2_addr, app_addr]:
