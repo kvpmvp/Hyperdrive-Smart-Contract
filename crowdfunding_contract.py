@@ -1,18 +1,20 @@
 from pyteal import *
 
 # --------- Global keys ---------
-KEY_GOAL     = Bytes("goal")       # microAlgos
-KEY_RATE     = Bytes("rate")       # tokens per 1e6 microAlgos
-KEY_DEADLINE = Bytes("deadline")   # round
-KEY_ASA      = Bytes("asa_id")
-KEY_RAISED   = Bytes("raised")     # total contributed, does NOT decrement on claim
-KEY_DEPOSIT  = Bytes("deposit")    # developer's 2% deposit (treated as remaining_deposit)
-KEY_CREATOR  = Bytes("creator")
-KEY_ADMIN    = Bytes("admin")
-KEY_FUNDED   = Bytes("funded")     # 0 or 1 latch
+KEY_GOAL           = Bytes("goal")         # microAlgos
+KEY_RATE           = Bytes("rate")         # tokens per 1e6 microAlgos
+KEY_DEADLINE       = Bytes("deadline")     # round
+KEY_ASA            = Bytes("asa_id")
+KEY_RAISED         = Bytes("raised")       # total contributed, does NOT decrement on claim
+KEY_DEPOSIT        = Bytes("deposit")      # developer's 2% deposit (treated as remaining_deposit)
+KEY_CREATOR        = Bytes("creator")
+KEY_ADMIN          = Bytes("admin")
+KEY_FUNDED         = Bytes("funded")       # 0 or 1 latch
+KEY_FEE_PAID       = Bytes("fee_paid")     # 0 or 1 latch (set by withdraw)
+KEY_CONTRIB_COUNT  = Bytes("contrib_count")# number of accounts with contrib > 0
 
 # --------- Local keys ----------
-LKEY_CONTRIB = Bytes("contrib")    # per‑investor contributed microAlgos
+LKEY_CONTRIB = Bytes("contrib")            # per‑investor contributed microAlgos
 
 def approval_program():
 
@@ -38,6 +40,8 @@ def approval_program():
         App.globalPut(KEY_ASA, Int(0)),
         App.globalPut(KEY_DEPOSIT, Int(0)),
         App.globalPut(KEY_FUNDED, Int(0)),
+        App.globalPut(KEY_FEE_PAID, Int(0)),
+        App.globalPut(KEY_CONTRIB_COUNT, Int(0)),
         Approve(),
     )
 
@@ -55,6 +59,11 @@ def approval_program():
     is_creator      = Txn.sender() == creator
     before_deadline = Global.round() <= deadline
     after_deadline  = Global.round() > deadline
+
+    # === Grace period (≈ 3 months) ===
+    # Approximate ~2.2M rounds (~90 days at ~3.5s/round). Adjust as needed.
+    GRACE_ROUNDS = Int(2_200_000)
+    after_grace  = Global.round() > (deadline + GRACE_ROUNDS)
 
     # ----- setup (one‑time) -----
     # Expected group layout:
@@ -131,9 +140,10 @@ def approval_program():
     # ----- contribute -----
     # Expected group: [0] AppCall("contribute"), [1] Payment(investor->app)
     investor = Txn.sender()
+    prev_contrib = ScratchVar(TealType.uint64)
+
     contribute = Seq(
         assert_sender_opted_in(),
-        # Investors may contribute any positive amount; no 2% check here.
         Assert(funded == Int(0)),          # freeze new funding once latched
         Assert(asa_id != Int(0)),          # setup must have happened
         Assert(before_deadline),
@@ -147,7 +157,14 @@ def approval_program():
         Assert(Gtxn[1].close_remainder_to() == Global.zero_address()),
         # Prevent oversubscription
         Assert(App.globalGet(KEY_RAISED) + Gtxn[1].amount() <= goal),
-        App.localPut(investor, LKEY_CONTRIB, App.localGet(investor, LKEY_CONTRIB) + Gtxn[1].amount()),
+
+        # Track first-time contributors to gate sweep_asa_success later
+        prev_contrib.store(App.localGet(investor, LKEY_CONTRIB)),
+        App.localPut(investor, LKEY_CONTRIB, prev_contrib.load() + Gtxn[1].amount()),
+        If(prev_contrib.load() == Int(0)).Then(
+            App.globalPut(KEY_CONTRIB_COUNT, App.globalGet(KEY_CONTRIB_COUNT) + Int(1))
+        ),
+
         App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) + Gtxn[1].amount()),
         If(App.globalGet(KEY_RAISED) == goal).Then(App.globalPut(KEY_FUNDED, Int(1))),
         Approve(),
@@ -176,31 +193,39 @@ def approval_program():
             }),
             InnerTxnBuilder.Submit(),
         )),
-        # Zero local contrib; DO NOT decrement global raised (kept as total)
+        # Decrement active contributors; then zero local contrib
+        App.globalPut(KEY_CONTRIB_COUNT, App.globalGet(KEY_CONTRIB_COUNT) - Int(1)),
         App.localPut(Txn.sender(), LKEY_CONTRIB, Int(0)),
         Approve(),
     )
 
-    # ----- withdraw (creator payout, admin 2% of total raised) -----
+    # ----- withdraw (creator payout; admin fee includes/consumes the 2% deposit) -----
     unlocked   = ScratchVar(TealType.uint64)
-    admin_fee  = ScratchVar(TealType.uint64)
+    fee_target = ScratchVar(TealType.uint64)  # 2% of total raised (latched at goal)
+    pay_admin  = ScratchVar(TealType.uint64)
     to_creator = ScratchVar(TealType.uint64)
 
     withdraw = Seq(
         Assert(is_creator),
-        Assert(funded == Int(1)),  # success only
+        Assert(funded == Int(1)),                               # success only
+        Assert(App.globalGet(KEY_FEE_PAID) == Int(0)),          # one-time
+
+        # Spendable ALGO
         unlocked.store(Balance(app_addr) - MinBalance(app_addr)),
-        # Platform fee = 2% of total raised (latched at goal)
-        admin_fee.store((App.globalGet(KEY_RAISED) * Int(2)) / Int(100)),
-        # Cap fee to what's available
-        admin_fee.store(If(admin_fee.load() <= unlocked.load(), admin_fee.load(), unlocked.load())),
-        to_creator.store(unlocked.load() - admin_fee.load()),
-        If(admin_fee.load() > Int(0)).Then(Seq(
+
+        # Platform fee target = 2% of RAISED
+        fee_target.store((App.globalGet(KEY_RAISED) * Int(2)) / Int(100)),
+
+        # Pay admin from unlocked (which includes the creator's deposit sitting in the vault)
+        pay_admin.store(If(fee_target.load() <= unlocked.load(), fee_target.load(), unlocked.load())),
+        to_creator.store(unlocked.load() - pay_admin.load()),
+
+        If(pay_admin.load() > Int(0)).Then(Seq(
             InnerTxnBuilder.Begin(),
             InnerTxnBuilder.SetFields({
                 TxnField.type_enum:  TxnType.Payment,
                 TxnField.receiver:   admin,
-                TxnField.amount:     admin_fee.load(),
+                TxnField.amount:     pay_admin.load(),
                 TxnField.fee:        Int(0),
             }),
             InnerTxnBuilder.Submit(),
@@ -215,6 +240,10 @@ def approval_program():
             }),
             InnerTxnBuilder.Submit(),
         )),
+
+        # Latch that fee path has run, and consume deposit accounting
+        App.globalPut(KEY_FEE_PAID, Int(1)),
+        App.globalPut(KEY_DEPOSIT, If(deposit > pay_admin.load(), deposit - pay_admin.load(), Int(0))),
         Approve(),
     )
 
@@ -233,6 +262,8 @@ def approval_program():
             TxnField.fee:        Int(0),
         }),
         InnerTxnBuilder.Submit(),
+        # Decrement active contributors; then zero local contrib and raised
+        App.globalPut(KEY_CONTRIB_COUNT, App.globalGet(KEY_CONTRIB_COUNT) - Int(1)),
         App.localPut(Txn.sender(), LKEY_CONTRIB, Int(0)),
         App.globalPut(KEY_RAISED, App.globalGet(KEY_RAISED) - contrib_amt.load()),
         Approve(),
@@ -240,31 +271,31 @@ def approval_program():
 
     # ----- reclaim (split developer deposit 50/50 on failure; one‑time) -----
     half        = ScratchVar(TealType.uint64)
-    pay_admin   = ScratchVar(TealType.uint64)
+    pay_admin2  = ScratchVar(TealType.uint64)
     pay_creator = ScratchVar(TealType.uint64)
 
     reclaim = Seq(
         Assert(after_deadline),
         Assert(App.globalGet(KEY_FUNDED) == Int(0)),
         Assert(is_creator),
-        # Ensure refunds are complete; prevents early reclaim before contributors are whole.
-        Assert(App.globalGet(KEY_RAISED) == Int(0)),
+        # CHANGED: allow reclaim if either all refunds are done OR we are past grace period
+        Assert(Or(after_grace, App.globalGet(KEY_RAISED) == Int(0))),
         # One‑time latch: deposit must still be present
         Assert(deposit > Int(0)),
         half.store(deposit / Int(2)),
         unlocked.store(Balance(app_addr) - MinBalance(app_addr)),
-        pay_admin.store(If(unlocked.load() < half.load(), unlocked.load(), half.load())),
+        pay_admin2.store(If(unlocked.load() < half.load(), unlocked.load(), half.load())),
         pay_creator.store(
-            If((unlocked.load() - pay_admin.load()) < half.load(),
-               unlocked.load() - pay_admin.load(),
+            If((unlocked.load() - pay_admin2.load()) < half.load(),
+               unlocked.load() - pay_admin2.load(),
                half.load())
         ),
-        If(pay_admin.load() > Int(0)).Then(Seq(
+        If(pay_admin2.load() > Int(0)).Then(Seq(
             InnerTxnBuilder.Begin(),
             InnerTxnBuilder.SetFields({
                 TxnField.type_enum:  TxnType.Payment,
                 TxnField.receiver:   admin,
-                TxnField.amount:     pay_admin.load(),
+                TxnField.amount:     pay_admin2.load(),
                 TxnField.fee:        Int(0),
             }),
             InnerTxnBuilder.Submit(),
@@ -290,7 +321,8 @@ def approval_program():
         Assert(after_deadline),
         Assert(App.globalGet(KEY_FUNDED) == Int(0)),
         Assert(is_creator),
-        Assert(App.globalGet(KEY_RAISED) == Int(0)),  # all refunds complete
+        # CHANGED: allow sweep if either all refunds are done OR we are past grace period
+        Assert(Or(after_grace, App.globalGet(KEY_RAISED) == Int(0))),
         Assert(asa_id != Int(0)),
         # Close out ASA holding to creator (moves any remainder + removes opt‑in)
         InnerTxnBuilder.Begin(),
@@ -306,13 +338,15 @@ def approval_program():
         Approve(),
     )
 
-    # ----- sweep ASA dust to creator after success (optional; post‑deadline claim window) -----
+    # ----- sweep ASA dust to creator after success (only when ALL contributors have claimed) -----
     sweep_asa_success = Seq(
         Assert(funded == Int(1)),
         Assert(is_creator),
         Assert(after_deadline),         # give claim window through deadline
         Assert(asa_id != Int(0)),
-        # Close out any residual ASA (e.g., rounding dust) to creator
+        # Only allow sweeping when no contributors have pending claims
+        Assert(App.globalGet(KEY_CONTRIB_COUNT) == Int(0)),
+        # Close out any residual ASA (removes opt‑in)
         InnerTxnBuilder.Begin(),
         InnerTxnBuilder.SetFields({
             TxnField.type_enum:      TxnType.AssetTransfer,
@@ -327,28 +361,31 @@ def approval_program():
     )
 
     # ----- final close: empty ALGO & close app account -----
-    # Success path requires ASA holding already closed (balance == 0),
+    # Success path requires fee_paid latch set, and ASA holding only after all claims are complete.
     # Failure path requires refunds complete, deposit reclaimed, and no ASA holding.
     asa_bal2 = AssetHolding.balance(app_addr, asa_id)
     close_vault = Seq(
         Assert(is_creator),
         If(funded == Int(1)).Then(Seq(
-            asa_bal2,
-            # if app was never setup, asa_id could be 0; treat as "no holding"
+            # Require that the fee path has run
+            Assert(App.globalGet(KEY_FEE_PAID) == Int(1)),
+            # NEW: Only allow final close after ALL contributors have claimed.
+            Assert(App.globalGet(KEY_CONTRIB_COUNT) == Int(0)),
+            # Allow both states: either no holding or holding; if holding exists, close it out.
             If(asa_id != Int(0)).Then(Seq(
-                Assert(asa_bal2.hasValue()),
-                Assert(asa_bal2.value() == Int(0)),
-                # ensure opt‑in is removed just in case (amount 0 close out)
-                InnerTxnBuilder.Begin(),
-                InnerTxnBuilder.SetFields({
-                    TxnField.type_enum:      TxnType.AssetTransfer,
-                    TxnField.xfer_asset:     asa_id,
-                    TxnField.asset_receiver: creator,
-                    TxnField.asset_amount:   Int(0),
-                    TxnField.asset_close_to: creator,
-                    TxnField.fee:            Int(0),
-                }),
-                InnerTxnBuilder.Submit(),
+                asa_bal2,
+                If(asa_bal2.hasValue()).Then(Seq(
+                    InnerTxnBuilder.Begin(),
+                    InnerTxnBuilder.SetFields({
+                        TxnField.type_enum:      TxnType.AssetTransfer,
+                        TxnField.xfer_asset:     asa_id,
+                        TxnField.asset_receiver: creator,
+                        TxnField.asset_amount:   Int(0),
+                        TxnField.asset_close_to: creator,
+                        TxnField.fee:            Int(0),
+                    }),
+                    InnerTxnBuilder.Submit(),
+                ))
             ))
         )).Else(Seq(
             # failure branch

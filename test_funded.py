@@ -204,7 +204,7 @@ def main():
         call = txn.ApplicationNoOpTxn(
             sender=addr, sp=p, index=app_id,
             app_args=[b"claim"],
-            foreign_assets=[asa_id],
+            foreign_assets=[asa_id],  # contract expects assets[0] == asa_id
         ).sign(sk)
         send_and_wait(algod_client, [call])
 
@@ -218,16 +218,17 @@ def main():
     app_pre     = get_algo(algod_client, app_addr)
 
     # ---- Creator withdraw ----
+    # This sets KEY_FEE_PAID = 1 in the app (required before close_vault on success).
     p = algod_client.suggested_params()
     p.flat_fee = True
-    p.fee = MIN_FEE * 6  # inner payments: admin + creator (+ fees safety)
+    p.fee = MIN_FEE * 6  # inner payments: admin + creator (+ safety)
     withdraw = txn.ApplicationNoOpTxn(
         sender=creator_addr,
         sp=p,
         index=app_id,
         app_args=[b"withdraw"],
-        accounts=[admin_addr],   # admin must be available to inner Payment
-        foreign_assets=[asa_id], # not strictly needed here unless you add ASA consolidation
+        accounts=[admin_addr],   # inner Payment to admin
+        # foreign_assets=[asa_id],  # not needed here
     ).sign(creator_sk)
 
     send_and_wait(algod_client, [withdraw])
@@ -245,16 +246,19 @@ def main():
     admin_gain   = admin_post - admin_pre
     creator_gain = creator_post - creator_pre
 
-    # Compute unlocked amount actually distributed (independent of min-balance/asset-close details)
+    # Unlocked actually sent out (independent of node min-balance mechanics)
     total_distributed = app_pre - app_post
-    expected_admin_fee = (total_distributed * 2) // 100
+
+    # IMPORTANT: The contract computes admin fee as 2% of RAISED (i.e., the goal),
+    # not 2% of "unlocked distributed".
+    expected_admin_fee = (goal_micro * 2) // 100
     expected_creator_gain = total_distributed - expected_admin_fee
 
     print("\n--- Payout Summary (expected vs observed) ---")
     print(f"App pre-withdraw balance: {app_pre} µAlgos")
     print(f"App post-withdraw balance (min-balance remains): {app_post} µAlgos")
     print(f"Unlocked distributed: {total_distributed} µAlgos")
-    print(f"Expected admin fee (2% of unlocked): {expected_admin_fee} µAlgos | Observed: {admin_gain} µAlgos")
+    print(f"Expected admin fee (2% of raised/goal): {expected_admin_fee} µAlgos | Observed: {admin_gain} µAlgos")
     print(f"Expected creator remainder: {expected_creator_gain} µAlgos | Observed: {creator_gain} µAlgos")
 
     SLACK = 8_000  # allow for fee dust
@@ -264,7 +268,8 @@ def main():
     assert app_post >= get_min_balance(algod_client, app_addr), "App balance below min-balance"
 
     # ---- Close the vault (success path) ----
-    # Provide foreign_assets and accounts so AssetHolding.* can read the app's ASA holding.
+    # Requires KEY_FEE_PAID == 1 (set by withdraw). We also pass app account and ASA so the TEAL
+    # can optionally close any lingering ASA holding; otherwise it just closes ALGO.
     p_close = algod_client.suggested_params()
     p_close.flat_fee = True
     p_close.fee = MIN_FEE * 4  # cover inner payment (+ optional ASA close-out)
@@ -275,7 +280,7 @@ def main():
         index=app_id,
         app_args=[b"close_vault"],
         accounts=[app_addr],       # make app account available
-        foreign_assets=[asa_id],   # make ASA available
+        foreign_assets=[asa_id],   # make ASA available for AssetHolding.*
     ).sign(creator_sk)
 
     send_and_wait(algod_client, [close_vault])

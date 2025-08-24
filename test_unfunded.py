@@ -153,13 +153,17 @@ def deploy_quick_deadline(algod_client: algod.AlgodClient,
     approval_prog = compile_program_bytes(algod_client, approval_teal)
     clear_prog    = compile_program_bytes(algod_client, clear_teal)
 
-    sp_app = algod_client.suggested_params(); sp_app.flat_fee = True; sp_app.fee = MIN_FEE
+    # --- CHANGE 1: Let node compute the minimum fee for AppCreate ---
+    sp_app = algod_client.suggested_params()
+    sp_app.flat_fee = False  # let node estimate min fee to avoid underpay
+
+    # --- CHANGE 2: Update global schema to 9 uints (fee_paid + contrib_count added) ---
     create_txn = txn.ApplicationCreateTxn(
         sender=creator_addr, sp=sp_app,
         on_complete=txn.OnComplete.NoOpOC.real,
         approval_program=approval_prog,
         clear_program=clear_prog,
-        global_schema=txn.StateSchema(num_uints=8, num_byte_slices=2),
+        global_schema=txn.StateSchema(num_uints=9, num_byte_slices=2),  # <-- was 8
         local_schema=txn.StateSchema(num_uints=1, num_byte_slices=0),
         app_args=[
             decode_address(admin_addr),
@@ -168,8 +172,14 @@ def deploy_quick_deadline(algod_client: algod.AlgodClient,
             int(deadline).to_bytes(8, "big"),
         ],
     )
+
     stx = create_txn.sign(creator_sk)
-    txid = algod_client.send_transaction(stx)
+    try:
+        txid = algod_client.send_transaction(stx)
+    except AlgodHTTPError as e:
+        # Surface helpful error details when node rejects the tx
+        print("AlgodHTTPError during AppCreate:", getattr(e, "args", e))
+        raise
     ptx = robust_wait_for_confirmation(algod_client, txid, 120)
     app_id = ptx["application-index"]
     app_addr = get_application_address(app_id)
@@ -278,12 +288,7 @@ def main():
     refund(inv2_addr, inv2_sk)
     print("Investors refunded.")
 
-    # ---- NEW: Creator reclaims deposit (one-time), sweeps ASA holding, then closes the vault ----
-    # Contract gates:
-    # - reclaim: after_deadline, funded==0, creator, raised==0, deposit>0
-    # - sweep_asa_failed: after_deadline, funded==0, creator, raised==0
-    # - close_vault (failure branch): after_deadline, raised==0, deposit==0 (reclaim done). Also ensures ASA holding is closed.
-    # Fees below are conservative to cover inner transactions.
+    # ---- Creator reclaims deposit (one-time), sweeps ASA holding, then closes the vault ----
     print("\nCreator reclaiming deposit...")
     p_reclaim = algod_client.suggested_params()
     p_reclaim.flat_fee = True

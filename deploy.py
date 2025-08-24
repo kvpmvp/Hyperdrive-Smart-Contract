@@ -162,7 +162,8 @@ def deploy_crowdfund(creator_mn: str, admin_mn: str, cfg: ProjectConfig):
         on_complete=txn.OnComplete.NoOpOC.real,
         approval_program=approval_prog,
         clear_program=clear_prog,
-        global_schema=txn.StateSchema(num_uints=8, num_byte_slices=2),
+        # CHANGED: 9 uints (goal, rate, deadline, asa_id, raised, deposit, funded, fee_paid, contrib_count)
+        global_schema=txn.StateSchema(num_uints=9, num_byte_slices=2),
         local_schema=txn.StateSchema(num_uints=1, num_byte_slices=0),
         app_args=app_args,
     )
